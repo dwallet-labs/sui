@@ -11,6 +11,7 @@ use crate::{
     CommitConsumerArgs, CommitConsumerMonitor, CommittedSubDag,
     block::{BlockAPI, VerifiedBlock},
     commit::{CommitAPI, load_committed_subdag_from_store},
+    commit_consumer::ReplayMode,
     commit_finalizer::{CommitFinalizer, CommitFinalizerHandle},
     context::Context,
     dag_state::DagState,
@@ -148,7 +149,13 @@ impl CommitObserver {
     async fn recover_and_send_commits(&mut self, commit_consumer: &CommitConsumerArgs) {
         let now = Instant::now();
 
-        let replay_after_commit_index = commit_consumer.replay_after_commit_index;
+        let replay_after_commit_index = match commit_consumer.replay_mode {
+            ReplayMode::FromWatermark {
+                replay_after_commit_index,
+                ..
+            } => replay_after_commit_index,
+            ReplayMode::FullEpochPaced => 0,
+        };
 
         let last_commit = self
             .store
@@ -160,7 +167,7 @@ impl CommitObserver {
         }
         // Storage ownership, target discovery, and commit decoding stay here.
         // Consumers rebuilding from empty never supply a second durable cursor.
-        let replay_target = if commit_consumer.full_replay {
+        let replay_target = if matches!(commit_consumer.replay_mode, ReplayMode::FullEpochPaced) {
             let target = if self.context.protocol_config.transaction_voting_enabled() {
                 self.store
                     .read_last_finalized_commit()
@@ -250,12 +257,13 @@ impl CommitObserver {
                 let committed_sub_dag =
                     load_committed_subdag_from_store(self.store.as_ref(), commit);
 
-                if commit_consumer.full_replay
+                if matches!(commit_consumer.replay_mode, ReplayMode::FullEpochPaced)
                     && self.context.protocol_config.transaction_voting_enabled()
                     && committed_sub_dag.commit_ref.index <= replay_target
                 {
-                    // A hole inside the finalized prefix cannot become a live
-                    // finalization wait while recovery is paced by application.
+                    // Finalized commits must have rejection metadata, even if empty.
+                    // Without it, finalization may need later commits while replay
+                    // waits for an acknowledgement, blocking startup.
                     assert!(
                         committed_sub_dag.recovered_rejected_transactions,
                         "missing rejected transactions below the finalized replay target"
@@ -296,7 +304,7 @@ impl CommitObserver {
 
                 tokio::task::yield_now().await;
             }
-            if commit_consumer.full_replay {
+            if matches!(commit_consumer.replay_mode, ReplayMode::FullEpochPaced) {
                 // Bound queued finalized history across BOTH the finalizer and
                 // consumer channels. Yielding alone does not apply backpressure.
                 // Do not await the unfinalized tail: it can require live consensus
@@ -434,7 +442,7 @@ mod tests {
         )
         .await
         .expect("legacy replay must not require application acknowledgements during startup");
-        assert_eq!(monitor.progress().replay_target, Some(4));
+        assert_eq!(monitor.replay_target(), Some(4));
         assert_eq!(monitor.progress().highest_committed_index, 7);
         assert_eq!(monitor.highest_handled_commit(), 2);
         for index in 3..=7 {
@@ -476,7 +484,7 @@ mod tests {
                 .unwrap()
                 .unwrap();
             assert_eq!(commit.commit_ref.index, index);
-            assert_eq!(monitor.progress().replay_target, Some(7));
+            assert_eq!(monitor.replay_target(), Some(7));
             assert_eq!(monitor.progress().highest_committed_index, 7);
             assert_eq!(
                 monitor.progress().highest_committed_round,
@@ -535,7 +543,7 @@ mod tests {
             .await
             .expect("unfinalized commits must not prevent live consensus startup")
             .unwrap();
-        assert_eq!(monitor.progress().replay_target, Some(finalized));
+        assert_eq!(monitor.replay_target(), Some(finalized));
         assert_eq!(monitor.highest_handled_commit(), finalized);
         monitor
             .replay_to_consumer_last_processed_commit_complete()
@@ -548,9 +556,9 @@ mod tests {
         let (context, dag_state, tracker) = full_replay_fixture(0, 0, false);
         let (args, _receiver) = CommitConsumerArgs::new_with_full_replay();
         let monitor = args.monitor();
-        assert_eq!(monitor.progress().replay_target, None);
+        assert_eq!(monitor.replay_target(), None);
         let mut observer = CommitObserver::new(context, args, dag_state, tracker).await;
-        assert_eq!(monitor.progress().replay_target, Some(0));
+        assert_eq!(monitor.replay_target(), Some(0));
         timeout(
             Duration::from_secs(1),
             monitor.replay_to_consumer_last_processed_commit_complete(),

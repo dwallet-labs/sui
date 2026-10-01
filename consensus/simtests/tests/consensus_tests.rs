@@ -431,7 +431,7 @@ mod consensus_tests {
 
         let (args, mut receiver) = CommitConsumerArgs::new_with_full_replay();
         let monitor = args.monitor();
-        assert_eq!(monitor.progress().replay_target, None);
+        assert_eq!(monitor.replay_target(), None);
         let restarting = authorities[0].clone();
         let startup =
             tokio::spawn(async move { restarting.start_with_commit_consumer(args).await });
@@ -445,7 +445,7 @@ mod consensus_tests {
                 monitor.set_highest_handled_commit(index);
             }
         }
-        let target = monitor.progress().replay_target.unwrap();
+        let target = monitor.replay_target().unwrap();
         let stored_head = monitor.progress().highest_committed_index;
         assert!(target >= HISTORY);
         assert!(stored_head >= target);
@@ -491,7 +491,7 @@ mod consensus_tests {
         let (args, mut receiver) = CommitConsumerArgs::new_with_full_replay();
         let monitor = args.monitor();
         assert_eq!(monitor.highest_handled_commit(), 0);
-        assert_eq!(monitor.progress().replay_target, None);
+        assert_eq!(monitor.replay_target(), None);
         let restarting = authorities[0].clone();
         let startup =
             tokio::spawn(async move { restarting.start_with_commit_consumer(args).await });
@@ -504,7 +504,7 @@ mod consensus_tests {
             if let Some(expected) = original.get(index as usize - 1) {
                 assert_replayed_commit(&commit, expected, voting);
             }
-            assert_eq!(monitor.progress().replay_target, Some(target));
+            assert_eq!(monitor.replay_target(), Some(target));
             if index == target {
                 assert!(
                     timeout(
@@ -586,7 +586,7 @@ mod consensus_tests {
             live_commit.rejected_transactions_by_block,
             peer_commit.rejected_transactions_by_block
         );
-        assert_eq!(monitor.progress().replay_target, Some(target));
+        assert_eq!(monitor.replay_target(), Some(target));
         assert!(monitor.progress().highest_committed_index >= live_commit.commit_ref.index);
         load.abort();
         for authority in authorities {
