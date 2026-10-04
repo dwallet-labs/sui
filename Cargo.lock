@@ -3670,12 +3670,14 @@ dependencies = [
 name = "consensus-config"
 version = "0.1.0"
 dependencies = [
+ "bcs",
  "fastcrypto",
  "insta",
- "mysten-network 0.2.0",
+ "mysten-network 0.2.0 (git+https://github.com/MystenLabs/sui?tag=mainnet-v1.77.2)",
  "rand 0.8.5",
  "serde",
- "shared-crypto 0.0.0",
+ "serde_json",
+ "shared-crypto 0.0.0 (git+https://github.com/MystenLabs/sui?tag=mainnet-v1.77.2)",
 ]
 
 [[package]]

@@ -11,10 +11,12 @@ workspace = true
 
 [dependencies]
 fastcrypto.workspace = true
-mysten-network.workspace = true
+mysten-network = { git = "https://github.com/MystenLabs/sui", tag = "mainnet-v1.77.2" }
 rand.workspace = true
 serde.workspace = true
-shared-crypto.workspace = true
+shared-crypto = { git = "https://github.com/MystenLabs/sui", tag = "mainnet-v1.77.2" }
 
 [dev-dependencies]
+bcs.workspace = true
 insta.workspace = true
+serde_json.workspace = true
