@@ -49,11 +49,22 @@ use crate::{block::Slot, context::Context, test_dag_builder::DagBuilder};
 /// dag_builder.persist_all_blocks(dag_state.clone()); // persist all blocks to DagState
 /// ```
 pub(crate) fn parse_dag(dag_string: &str) -> IResult<&str, DagBuilder> {
+    parse_dag_with_transaction_voting(dag_string, true)
+}
+
+pub(crate) fn parse_dag_with_transaction_voting(
+    dag_string: &str,
+    transaction_voting_enabled: bool,
+) -> IResult<&str, DagBuilder> {
     let (input, _) = tuple((tag("DAG"), multispace0, char('{')))(dag_string)?;
 
     let (mut input, num_authors) = parse_genesis(input)?;
 
-    let context = Arc::new(Context::new_for_test(num_authors as usize).0);
+    let mut context = Context::new_for_test(num_authors as usize).0;
+    context
+        .protocol_config
+        .set_transaction_voting_enabled_for_testing(transaction_voting_enabled);
+    let context = Arc::new(context);
     let mut dag_builder = DagBuilder::new(context);
 
     // Parse subsequent rounds

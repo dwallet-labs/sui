@@ -4,6 +4,8 @@
 use futures::FutureExt as _;
 use tokio::task::{JoinHandle, JoinSet};
 
+use crate::error::ConsensusError;
+
 /// Awaits the task and propagates its panic if it panicked. Task cancellation is ignored.
 pub(crate) async fn join_and_propagate_panic<T>(task: JoinHandle<T>) {
     if let Err(error) = task.await
@@ -46,4 +48,14 @@ pub(crate) fn reap_finished_task(task: &mut JoinHandle<()>) -> bool {
         std::panic::resume_unwind(error.into_panic());
     }
     true
+}
+
+/// Converts a JoinError from a spawn_blocking task into a ConsensusError.
+/// Panics from the blocking task are resumed on the calling thread. Otherwise the task
+/// was cancelled, which only happens when the runtime is shutting down.
+pub(crate) fn spawn_blocking_join_error(e: tokio::task::JoinError) -> ConsensusError {
+    if e.is_panic() {
+        std::panic::resume_unwind(e.into_panic());
+    }
+    ConsensusError::Shutdown
 }

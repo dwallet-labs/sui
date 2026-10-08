@@ -348,6 +348,8 @@ impl Core {
         for block in &accepted_blocks {
             self.signals.new_accepted_block(block.clone());
         }
+        #[cfg(test)]
+        sui_macros::handle_fail_point("consensus-after-accept-certified-blocks");
         accepted_blocks
     }
 
@@ -652,19 +654,6 @@ impl Core {
                 .into_iter()
                 .unzip();
 
-            // Only accept blocks for the certified commits that we are certain to sequence.
-            // This ensures that only blocks corresponding to committed certified commits are flushed to disk.
-            // Blocks from non-committed certified commits will not be flushed, preventing issues during crash-recovery.
-            // This avoids scenarios where accepting and flushing blocks of non-committed certified commits could lead to
-            // premature commit rule execution. Due to GC, this could cause a panic if the commit rule tries to access
-            // missing causal history from blocks of certified commits.
-            let blocks = decided_certified_commits
-                .iter()
-                .flat_map(|c| c.blocks())
-                .cloned()
-                .collect::<Vec<_>>();
-            self.accept_committed_blocks(blocks);
-
             // If there is no certified commit to process, run the decision rule.
             let (decided_leaders, local) = if certified_leaders.is_empty() {
                 // TODO: limit commits by commits_until_update for efficiency, which may be needed when leader schedule length is reduced.
@@ -710,9 +699,23 @@ impl Core {
             );
 
             // TODO: refcount subdags
-            let subdags = self
-                .commit_observer
-                .handle_commit(sequenced_leaders, local)?;
+            let subdags = if local {
+                self.commit_observer
+                    .handle_commit(sequenced_leaders, true)?
+            } else {
+                let mut subdags = Vec::with_capacity(sequenced_leaders.len());
+                for (leader, certified_commit) in sequenced_leaders
+                    .into_iter()
+                    .zip_eq(decided_certified_commits)
+                {
+                    // A certified subdag can omit ancestors at or below the preceding commit's
+                    // GC round. Insert that commit before accepting the next subdag, so a
+                    // concurrent finalizer flush cannot persist blocks without their GC boundary.
+                    self.accept_committed_blocks(certified_commit.blocks().to_vec());
+                    subdags.extend(self.commit_observer.handle_commit(vec![leader], false)?);
+                }
+                subdags
+            };
 
             // Try to unsuspend blocks if gc_round has advanced.
             self.block_manager
@@ -1026,6 +1029,29 @@ impl CoreTestFixture {
         sync_last_known_own_block: bool,
         prepopulated_blocks: Vec<VerifiedBlock>,
     ) -> Self {
+        let store = Arc::new(MemStore::new());
+        if !prepopulated_blocks.is_empty() {
+            store
+                .write(WriteBatch::default().blocks(prepopulated_blocks))
+                .expect("Storage error");
+        }
+        Self::new_with_store(
+            context,
+            authorities,
+            own_index,
+            sync_last_known_own_block,
+            store,
+        )
+        .await
+    }
+
+    async fn new_with_store(
+        context: Context,
+        authorities: Vec<Stake>,
+        own_index: AuthorityIndex,
+        sync_last_known_own_block: bool,
+        store: Arc<MemStore>,
+    ) -> Self {
         let (committee, mut signers) = local_committee_and_keys(0, authorities.clone());
         let mut context = context.clone();
         context = context
@@ -1036,12 +1062,6 @@ impl CoreTestFixture {
             .set_bad_nodes_stake_threshold_for_testing(33);
 
         let context = Arc::new(context);
-        let store = Arc::new(MemStore::new());
-        if !prepopulated_blocks.is_empty() {
-            store
-                .write(WriteBatch::default().blocks(prepopulated_blocks))
-                .expect("Storage error");
-        }
         let dag_state = Arc::new(RwLock::new(DagState::new(context.clone(), store.clone())));
 
         let block_manager = BlockManager::new(context.clone(), dag_state.clone());
@@ -1131,7 +1151,7 @@ mod test {
         leader_scoring::ReputationScores,
         storage::{Store, WriteBatch, mem_store::MemStore},
         test_dag_builder::DagBuilder,
-        test_dag_parser::parse_dag,
+        test_dag_parser::{parse_dag, parse_dag_with_transaction_voting},
         transaction::{BlockStatus, Priority, TransactionClient},
     };
 
@@ -3417,6 +3437,182 @@ mod test {
         // THEN
         assert_eq!(leaders.len(), 2);
         assert_eq!(certified_commits.len(), 2);
+    }
+
+    #[rstest::rstest]
+    #[case::voting_disabled(false)]
+    #[case::voting_enabled(true)]
+    #[tokio::test(start_paused = true)]
+    async fn certified_commits_recover_after_flush_before_insertion(
+        #[case] transaction_voting_enabled: bool,
+    ) {
+        use crate::linearizer::Linearizer;
+
+        // G is catching up while E returns from an outage with its old self-link.
+        // The other five authorities maintain quorum without committing E1.
+        let (_, builder) = parse_dag_with_transaction_voting("DAG {
+            Round 0 : { 7 },
+            Round 1 : { A -> [*], B -> [*], C -> [*], D -> [*], E -> [*], F -> [*] },
+            Round 2 : { A -> [-E1], B -> [-E1], C -> [-E1], D -> [-E1], F -> [-E1] },
+            Round 3 : { A -> [*], B -> [*], C -> [*], D -> [*], F -> [*] },
+            Round 4 : { A -> [*], B -> [*], C -> [*], D -> [*], F -> [*] },
+            Round 5 : { A -> [*], B -> [*], C -> [*], D -> [*], E -> [A4, B4, C4, D4, F4, E1], F -> [*] },
+            Round 6 : { A -> [*], B -> [*], C -> [*], D -> [*], E -> [*], F -> [*] },
+            Round 7 : { A -> [*], B -> [*], C -> [*], D -> [*], E -> [*], F -> [*] }
+        }", transaction_voting_enabled).unwrap();
+        let mut context = (*builder.context).clone();
+        context.protocol_config.set_gc_depth_for_testing(4);
+        context.protocol_config.set_enable_v3_for_testing(false);
+        context
+            .protocol_config
+            .set_transaction_voting_enabled_for_testing(transaction_voting_enabled);
+        let own_index = AuthorityIndex::new_for_test(6);
+        let block = |round, author| {
+            builder
+                .all_blocks()
+                .into_iter()
+                .find(|b| b.round() == round && b.author() == AuthorityIndex::new_for_test(author))
+                .unwrap()
+        };
+        let e1 = block(1, 4);
+        let e5 = block(5, 4);
+        let leaders = vec![
+            block(1, 1),
+            block(2, 2),
+            block(3, 3),
+            block(5, 5),
+            block(7, 0),
+        ];
+
+        let source_store = Arc::new(MemStore::new());
+        let source_dag = Arc::new(RwLock::new(DagState::new(
+            Arc::new(context.clone()),
+            source_store.clone(),
+        )));
+        source_dag.write().accept_blocks(builder.all_blocks());
+        let subdags =
+            Linearizer::new(Arc::new(context.clone()), source_dag.clone()).handle_commit(leaders);
+        source_dag.write().flush();
+        let certified_commits = source_store
+            .scan_commits((1..=subdags.len() as u32).into())
+            .unwrap()
+            .into_iter()
+            .zip_eq(&subdags)
+            .map(|(commit, subdag)| CertifiedCommit::new_certified(commit, subdag.blocks.clone()))
+            .collect::<Vec<_>>();
+        assert!(subdags.iter().all(|subdag| {
+            subdag
+                .blocks
+                .iter()
+                .all(|b| b.reference() != e1.reference())
+        }));
+        assert!(
+            subdags
+                .last()
+                .unwrap()
+                .blocks
+                .iter()
+                .any(|b| b.reference() == e5.reference())
+        );
+
+        for crash_before_index in 2..=certified_commits.len() {
+            let mut fixture =
+                CoreTestFixture::new(context.clone(), vec![1; 7], own_index, true).await;
+            // Commit sync verifies and votes on fetched blocks before forwarding them to Core.
+            fixture.transaction_vote_tracker.add_voted_blocks(
+                certified_commits
+                    .iter()
+                    .flat_map(|commit| commit.blocks().iter().cloned())
+                    .map(|block| (block, vec![]))
+                    .collect(),
+            );
+            let (_, missing) = fixture.core.accept_blocks(
+                builder
+                    .all_blocks()
+                    .into_iter()
+                    .filter(|block| block.round() <= 3 && block.reference() != e1.reference())
+                    .collect(),
+            );
+            assert!(missing.is_empty());
+            let prior = fixture.core.try_commit(vec![]).unwrap();
+            assert_eq!(prior.len(), 1);
+            assert!(prior[0].decided_with_local_blocks);
+            assert_eq!(prior[0].commit_ref, certified_commits[0].reference());
+
+            // A finalizer handling the prior commit can flush at any block-acceptance
+            // boundary, before Core inserts the current certified commit.
+            let dag = fixture.dag_state.clone();
+            let accepted_leader = certified_commits[crash_before_index - 1].leader();
+            let finalized_commit_ref = prior[0].commit_ref;
+            let test_thread = std::thread::current().id();
+            sui_macros::register_fail_point("consensus-after-accept-certified-blocks", move || {
+                if std::thread::current().id() != test_thread {
+                    return;
+                }
+                let mut dag = dag.write();
+                if dag.last_commit_index() != crash_before_index as u32 - 1 {
+                    return;
+                }
+                assert!(dag.contains_block(&accepted_leader));
+                dag.add_finalized_commit(finalized_commit_ref, BTreeMap::new());
+                dag.flush();
+                panic!("crash after certified block acceptance");
+            });
+            let crash = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                fixture.core.try_commit(certified_commits[1..].to_vec())
+            }));
+            sui_macros::clear_fail_point("consensus-after-accept-certified-blocks");
+            assert_eq!(
+                crash.unwrap_err().downcast_ref::<&str>(),
+                Some(&"crash after certified block acceptance")
+            );
+            let store = fixture.store.clone();
+            assert_eq!(
+                store.read_last_commit().unwrap().unwrap().index(),
+                crash_before_index as u32 - 1
+            );
+            // Drain the fixture's tasks without adding the interrupted commit.
+            fixture.core.stop().await;
+            drop(fixture);
+
+            // Exercise Core's actual startup decision rule, then resume commit sync.
+            // Batch acceptance would persist E5 with GC=0 and panic on its absent E1 ancestor.
+            let mut recovered = CoreTestFixture::new_with_store(
+                context.clone(),
+                vec![1; 7],
+                own_index,
+                true,
+                store.clone(),
+            )
+            .await;
+            assert!(!recovered.dag_state.read().contains_block(&e1.reference()));
+            let remaining = recovered
+                .core
+                .filter_new_commits(certified_commits.clone())
+                .unwrap();
+            recovered.transaction_vote_tracker.add_voted_blocks(
+                remaining
+                    .iter()
+                    .flat_map(|commit| commit.blocks().iter().cloned())
+                    .map(|block| (block, vec![]))
+                    .collect(),
+            );
+            let resumed = recovered.core.try_commit(remaining).unwrap();
+            assert!(
+                resumed
+                    .iter()
+                    .all(|subdag| !subdag.decided_with_local_blocks)
+            );
+            recovered.dag_state.write().flush();
+            let commits = store
+                .scan_commits((1..=certified_commits.len() as u32).into())
+                .unwrap();
+            assert_eq!(commits.len(), certified_commits.len());
+            for (actual, expected) in commits.iter().zip_eq(&certified_commits) {
+                assert_eq!(actual.reference(), expected.reference());
+            }
+            recovered.core.stop().await;
+        }
     }
 
     pub(crate) async fn receive<T: Copy>(timeout: Duration, mut receiver: watch::Receiver<T>) -> T {
